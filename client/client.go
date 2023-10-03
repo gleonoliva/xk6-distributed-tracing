@@ -2,15 +2,18 @@ package client
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/dop251/goja"
 	"go.k6.io/k6/js/modules"
 	k6HTTP "go.k6.io/k6/js/modules/k6/http"
 	"go.k6.io/k6/metrics"
+	"go.opentelemetry.io/contrib/propagators/b3"
+	"go.opentelemetry.io/contrib/propagators/jaeger"
+	"go.opentelemetry.io/contrib/propagators/ot"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Options struct {
@@ -20,6 +23,7 @@ type Options struct {
 type TracingClient struct {
 	vu          modules.VU
 	httpRequest HttpRequestFunc
+	tracer      trace.Tracer
 
 	options Options
 }
@@ -34,11 +38,13 @@ type (
 	HttpFunc        func(ctx context.Context, url goja.Value, args ...goja.Value) (*k6HTTP.Response, error)
 )
 
-func New(vu modules.VU, requestFunc HttpRequestFunc, options Options) *TracingClient {
+func New(vu modules.VU, requestFunc HttpRequestFunc, tracer trace.Tracer, options Options) *TracingClient {
+
 	return &TracingClient{
 		httpRequest: requestFunc,
 		vu:          vu,
 		options:     options,
+		tracer:      tracer,
 	}
 }
 
@@ -87,19 +93,27 @@ func (c *TracingClient) WithTrace(fn HttpFunc, spanName string, url goja.Value, 
 		return nil, fmt.Errorf("HTTP requests can only be made in the VU context")
 	}
 
-	traceID, err := Encode(TraceID{
-		Prefix: K6Prefix,
-		Code:   K6CloudCode,
-		Time:   time.Now(),
-	}, rand.Reader)
-	if err != nil {
-		return nil, err
-	}
+	propagator := pickPropagator(c.options.Propagator)
+
+	ctx, span := c.tracer.Start(context.Background(), spanName)
+	defer span.End()
+	traceID := span.SpanContext().TraceID().String()
+
+	// traceID, err := Encode(TraceID{
+	// 	Prefix: K6Prefix,
+	// 	Code:   K6CloudCode,
+	// 	Time:   time.Now(),
+	// }, rand.Reader)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
 	tracingHeaders, err := GenerateHeaderBasedOnPropagator(c.options.Propagator, traceID)
 	if err != nil {
 		return nil, err
 	}
+
+	propagator.Inject(ctx, propagation.HeaderCarrier(tracingHeaders))
 
 	// This makes sure that the tracing header will always be added correctly to
 	// the HTTP request headers, whether they were explicitly specified by the
@@ -149,4 +163,21 @@ func (c *TracingClient) WithTrace(fn HttpFunc, spanName string, url goja.Value, 
 	res, e := fn(c.vu.Context(), url, args...)
 
 	return &HTTPResponse{Response: res, TraceID: traceID}, e
+}
+
+func pickPropagator(propagator string) propagation.TextMapPropagator {
+	switch propagator {
+	case "w3c":
+		return propagation.TraceContext{}
+	case "b3":
+		return b3.New()
+	case "jaeger":
+		return jaeger.Jaeger{}
+	case "ot":
+		return ot.OT{}
+	// case "aws":
+	// 	return xray.Propagator{}
+	default:
+		return propagation.TraceContext{}
+	}
 }

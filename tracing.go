@@ -1,15 +1,21 @@
 package tracing
 
 import (
+	"context"
 	"fmt"
+	"log"
 
 	"github.com/dop251/goja"
 	"github.com/grafana/xk6-distributed-tracing/client"
-	crocospans "github.com/grafana/xk6-distributed-tracing/cloud"
 	"go.k6.io/k6/js/common"
 	"go.k6.io/k6/js/modules"
 	k6HTTP "go.k6.io/k6/js/modules/k6/http"
-	"go.k6.io/k6/output"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 )
 
 const version = "0.2.0"
@@ -17,9 +23,13 @@ const version = "0.2.0"
 func init() {
 	modules.Register("k6/x/tracing", New())
 
-	output.RegisterExtension("xk6-crocospans", func(p output.Params) (output.Output, error) {
-		return crocospans.New(p)
-	})
+	// output.RegisterExtension("xk6-crocospans", func(p output.Params) (output.Output, error) {
+	// 	return crocospans.New(p)
+	// })
+
+	// output.RegisterExtension("xk6-otel", func(p output.Params) (output.Output, error) {
+	// 	return otelspans.New(p)
+	// })
 }
 
 type (
@@ -55,6 +65,9 @@ func (*RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
 	if err != nil {
 		panic(err)
 	}
+
+	// TODO: Does the traceprovider need to be instantiated here?
+
 	return &DistributedTracing{vu: vu, httpRequest: requestFunc}
 }
 
@@ -92,6 +105,15 @@ func (t *DistributedTracing) parseClientOptions(val goja.Value) (client.Options,
 	return opts, nil
 }
 
+func newResource() *resource.Resource {
+	// TODO: Update key values once upgraded to otel v1.19.0
+	return resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String("xk6-otlptrace"),
+		semconv.ServiceVersionKey.String("0.0.1"),
+	)
+}
+
 func (t *DistributedTracing) http(call goja.ConstructorCall) *goja.Object {
 	rt := t.vu.Runtime()
 	opts, err := t.parseClientOptions(call.Argument(0))
@@ -99,5 +121,22 @@ func (t *DistributedTracing) http(call goja.ConstructorCall) *goja.Object {
 		common.Throw(rt, err)
 	}
 
-	return rt.ToValue(client.New(t.vu, t.httpRequest, opts)).ToObject(rt)
+	// Instantiate a trace provider for each grpc client.
+	traceClient := otlptracegrpc.NewClient()
+	exporter, err := otlptrace.New(context.Background(), traceClient)
+	if err != nil {
+		log.Fatalf("creating OTLP trace exporter: %w", err)
+	}
+
+	traceProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(newResource()),
+	)
+
+	otel.SetTracerProvider(traceProvider)
+	tracer := traceProvider.Tracer("xk6-otel-tracing")
+	// trace.WithInstrumentationVersion("0.0.1"),
+	// trace.WithSchemaURL(semconv.SchemaURL),
+
+	return rt.ToValue(client.New(t.vu, t.httpRequest, tracer, opts)).ToObject(rt)
 }
